@@ -12,6 +12,7 @@ use std::str::FromStr;
 use anyhow::Context as _;
 use cargo_util::paths;
 use cargo_util_schemas::core::PartialVersion;
+use cargo_util_schemas::manifest::PathBaseName;
 use cargo_util_schemas::manifest::RustVersion;
 use indexmap::IndexSet;
 use itertools::Itertools;
@@ -28,6 +29,7 @@ use crate::core::Workspace;
 use crate::sources::source::QueryKind;
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::style;
+use crate::util::toml::lookup_path_base;
 use crate::util::toml_mut::dependency::Dependency;
 use crate::util::toml_mut::dependency::GitSource;
 use crate::util::toml_mut::dependency::MaybeWorkspace;
@@ -270,8 +272,11 @@ pub struct DepOp {
     /// Registry for looking up dependency version
     pub registry: Option<String>,
 
-    /// Git repo for dependency
+    /// File system path for dependency
     pub path: Option<String>,
+    /// Specify a named base for a path dependency
+    pub base: Option<String>,
+
     /// Git repo for dependency
     pub git: Option<String>,
     /// Specify an alternative git branch
@@ -331,10 +336,25 @@ fn resolve_dependency(
         };
         selected
     } else if let Some(raw_path) = &arg.path {
-        let path = paths::normalize_path(&std::env::current_dir()?.join(raw_path));
-        let src = PathSource::new(&path);
+        let (path, base_name_and_value) = if let Some(base_name) = &arg.base {
+            let workspace_root = || Ok(ws.root_manifest().parent().unwrap());
+            let base_value = lookup_path_base(
+                &PathBaseName::new(base_name.clone())?,
+                gctx,
+                &workspace_root,
+                None,
+            )?;
+            (
+                base_value.join(raw_path),
+                Some((base_name.clone(), base_value)),
+            )
+        } else {
+            (std::env::current_dir()?.join(raw_path), None)
+        };
+        let path = paths::normalize_path(&path);
+        let src = PathSource::new(path);
 
-        let selected = if let Some(crate_spec) = &crate_spec {
+        let mut selected = if let Some(crate_spec) = &crate_spec {
             if let Some(v) = crate_spec.version_req() {
                 // crate specifier includes a version (e.g. `docopt@0.8`)
                 anyhow::bail!("cannot specify a path (`{raw_path}`) with a version (`{v}`).");
@@ -349,10 +369,15 @@ fn resolve_dependency(
             }
             selected
         } else {
-            let mut source = crate::sources::PathSource::new(&path, src.source_id()?, gctx);
+            let mut source = crate::sources::PathSource::new(&src.path, src.source_id()?, gctx);
             let package = source.root_package()?;
             Dependency::from(package.summary())
         };
+        if let Some(selected_source) = selected.source.as_mut() {
+            if let Source::Path(selected_source) = selected_source {
+                selected_source.base_name_and_value = base_name_and_value;
+            }
+        }
         selected
     } else if let Some(crate_spec) = &crate_spec {
         crate_spec.to_dependency()?
